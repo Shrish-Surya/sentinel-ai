@@ -1,0 +1,32 @@
+# docker compose up --build                  -> demo on a bundled sample video (no camera)
+# docker compose --profile webcam up --build -> live webcam (Linux hosts with /dev/video0)
+
+services:
+  sentinel:
+    build: .
+    image: sentinel-ai
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data            # events.db and forensic clips survive restarts
+    environment:
+      VIDEO_SOURCE: demo            # or a file path, rtsp://..., http://...
+      WEBHOOK_URL: ""
+    restart: unless-stopped
+
+  sentinel-webcam:
+    profiles: ["webcam"]
+    image: sentinel-ai
+    build: .
+    ports:
+      - "8000:8000"
+    devices:
+      - /dev/video0:/dev/video0
+    group_add:
+      - video
+    volumes:
+      - ./data:/app/data
+    environment:
+      VIDEO_SOURCE: "0"
+      LOOP_VIDEO: "false"
+    restart: unless-stopped

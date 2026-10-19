@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+
+# Deep Learning Models
+*.pt
+*.pth
+*.onnx
+
+# Local Data & Assets
+assets/*.mp4
+assets/*.gif
+demo_videos/*
+!demo_videos/ATTRIBUTION.md
+outputs/
+backend/data/
+data/
+*.avi
+*.mp4
+test_pipeline.py
+test.html
+.pytest_cache/
+.ruff_cache/
+.claude/
+
+# Frontend
+node_modules/
+dist/
+.env
+.DS_Store

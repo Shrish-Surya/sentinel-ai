@@ -1,0 +1,1977 @@
+"""FastAPI server: REST API, WebSocket live feed, and the built dashboard.
+
+Threading model: the pipeline runs in a background thread. It publishes each frame
+as one pre-serialised JSON message (encoded once, shared by every client) and pushes
+alerts into a per-client asyncio queue via ``loop.call_soon_threadsafe``, so alerts are
+never lost to frame-rate throttling.
+"""
+
+import asyncio
+import base64
+import contextlib
+import copy
+import json
+import logging
+import os
+import random
+import threading
+import time
+from collections import deque
+from pathlib import Path
+
+import cv2
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field, field_validator
+
+from config.settings import SentinelConfig
+from core.pipeline import FrameResult, SentinelPipeline
+from core.recorder import Recorder
+from core.utils import to_serializable
+from events import EVENT_TYPES, GROUP_BY_KEYS, SEVERITIES, Event, EventStore
+from posture.classifier import POSTURES
+from posture.history import current_tip
+
+logger = logging.getLogger("sentinel.api")
+
+MAX_FEED_FPS = 15
+FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
+
+# --- Global state (written by the pipeline thread, read by async handlers) ---
+pipeline: SentinelPipeline | None = None
+config: SentinelConfig | None = None
+alert_history: deque = deque(maxlen=1000)
+history_lock = threading.Lock()
+_latest_message: str | None = None  # pre-serialised "frame" message
+_latest_frame_number = -1
+_frame_lock = threading.Lock()
+_clients: dict[WebSocket, asyncio.Queue] = {}
+_clients_lock = threading.Lock()
+_loop: asyncio.AbstractEventLoop | None = None
+
+# Extra cameras beside the primary pipeline (the laptop webcam). Each has its own pipeline,
+# frame slot and state; events from every camera share the store and the alert stream.
+LAPTOP_CAMERA = "laptop"
+_cameras: dict[str, SentinelPipeline] = {}
+_camera_threads: dict[str, threading.Thread] = {}
+_camera_state: dict[str, dict] = {}
+_camera_frames: dict[str, tuple[str, int]] = {}
+_cameras_lock = threading.Lock()
+
+@contextlib.asynccontextmanager
+async def _lifespan(_app):
+    yield
+    stop_cameras()  # release the webcam when the server shuts down
+
+
+app = FastAPI(title="Sentinel AI API", version="1.3.0", lifespan=_lifespan)
+
+
+def _configure_cors(origins):
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_credentials=False,
+        allow_methods=["GET"],
+        allow_headers=["*"],
+    )
+
+
+# --- Pipeline wiring -----------------------------------------------------------------
+
+def start_pipeline(cfg: SentinelConfig) -> SentinelPipeline:
+    """Create the pipeline, hook its callbacks, and run it in a daemon thread."""
+    global pipeline, config
+    config = cfg
+    _configure_cors(cfg.cors_origins)
+    pipeline = SentinelPipeline(cfg)
+    _attach(pipeline, primary=True)
+    _apply_app_settings(pipeline, _load_app_settings())
+    _exam_attach(pipeline)
+    _apply_object_classes(pipeline, _load_app_settings())
+    _start_retention()
+    thread = threading.Thread(target=pipeline.run, daemon=True, name="sentinel-pipeline")
+    thread.start()
+    logger.info("Sentinel Pipeline started in background thread.")
+    return pipeline
+
+
+def _attach(p: SentinelPipeline, primary: bool) -> None:
+    """Broadcast ``p``'s events to every client and publish its frames to its slot."""
+
+    def handle_event(event: Event):
+        # Same alert shape the dashboard always received, plus event_id and camera_id.
+        alert_dict = to_serializable(event.to_alert_dict())
+        if p.config.camera_id == TEST_CAMERA:
+            alert_dict["test"] = True  # demo footage: labelled TEST, not counted as new
+        with history_lock:
+            alert_history.append(alert_dict)
+        _broadcast_alert(json.dumps({"type": "alert", "alert": alert_dict}))
+
+    p.event_bus.subscribe("websocket", handle_event)
+    camera_id = p.config.camera_id
+
+    @p.on_frame
+    def handle_frame(result: FrameResult):
+        global _latest_message, _latest_frame_number
+        message = encode_frame_message(result, p.stats["avg_fps"])
+        with _frame_lock:  # serialise once; every client of this camera sends the same string
+            if primary:
+                _latest_message, _latest_frame_number = message, result.frame_number
+            else:
+                _camera_frames[camera_id] = (message, result.frame_number)
+
+
+def encode_frame_message(result: FrameResult, fps: float, jpeg_quality: int = 70) -> str:
+    """The WebSocket "frame" message: annotated JPEG (base64) plus the frame's data."""
+    image = None
+    if result.annotated_frame is not None:
+        ok, buffer = cv2.imencode(".jpg", result.annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
+        if ok:
+            image = base64.b64encode(buffer).decode("ascii")
+    payload = result.to_dict()
+    payload["stats"]["fps"] = fps
+    return json.dumps({"type": "frame", "image": image, "data": payload})
+
+
+def _broadcast_alert(message: str):
+    if _loop is None:
+        return
+    with _clients_lock:
+        queues = list(_clients.values())
+    for q in queues:
+        _loop.call_soon_threadsafe(_offer, q, message)
+
+
+def _offer(q: asyncio.Queue, message: str):
+    if q.full():  # a stalled client must not grow memory without bound
+        with contextlib.suppress(asyncio.QueueEmpty):
+            q.get_nowait()
+    q.put_nowait(message)
+
+
+# --- REST endpoints ------------------------------------------------------------------
+
+def _require_pipeline() -> SentinelPipeline:
+    if not pipeline:
+        raise HTTPException(status_code=503, detail="Pipeline not initialized")
+    return pipeline
+
+
+def _pipeline_for(camera: str | None) -> SentinelPipeline:
+    """The primary pipeline, or the extra camera named ``camera`` (404/503 if it isn't running)."""
+    primary = _require_pipeline() if camera is None else pipeline
+    if camera is None or (primary is not None and camera == primary.config.camera_id):
+        return _require_pipeline()
+    with _cameras_lock:
+        p = _cameras.get(camera)
+    if p is None:
+        raise HTTPException(status_code=404, detail=f"camera {camera!r} is not running")
+    return p
+
+
+@app.get("/api/health")
+def health_check():
+    source = pipeline.video_source.stats if pipeline else {}
+    return {
+        "status": "ok" if pipeline and not source.get("hardware_error") else "degraded",
+        "pipeline": pipeline is not None,
+        "source": config.source if config else None,
+        "source_error": source.get("error_message", ""),
+        "timestamp": time.time(),
+    }
+
+
+@app.get("/api/stats")
+def get_stats(camera: str | None = None):
+    return to_serializable(_pipeline_for(camera).stats)
+
+
+# --- Cameras: the primary source plus the laptop webcam, started on request ----------
+
+ZONE_TYPES = ("restricted", "time_limited", "one_way")
+
+
+class ZoneIn(BaseModel):
+    """One zone from the editor. Points are normalised (0-1) image coordinates."""
+
+    id: str = Field(min_length=1, max_length=40, pattern=r"^[A-Za-z0-9_-]+$")
+    name: str = Field(min_length=1, max_length=60)
+    zone_type: str = Field(pattern=r"^(restricted|time_limited|one_way)$")
+    polygon: list[tuple[float, float]] = Field(min_length=3, max_length=50)
+    time_limit: float = Field(0.0, ge=0, le=86400)
+    direction: str | None = Field(None, pattern=r"^(up|down|left|right)$")
+    active: bool = True
+    load_score: int = Field(0, ge=0, le=3, description="REBA load/force score for work in this zone")
+
+    def checked(self) -> "ZoneIn":
+        if any(not (0.0 <= v <= 1.0) for point in self.polygon for v in point):
+            raise HTTPException(status_code=422, detail=f"zone {self.id!r}: points must be within 0-1")
+        if self.zone_type == "time_limited" and self.time_limit <= 0:
+            raise HTTPException(status_code=422, detail=f"zone {self.id!r}: time_limited needs time_limit > 0")
+        if self.zone_type == "one_way" and not self.direction:
+            raise HTTPException(status_code=422, detail=f"zone {self.id!r}: one_way needs a direction")
+        from anomaly.geometry import fix_polygon, self_intersections
+
+        crossings = self_intersections(self.polygon)
+        if crossings:
+            fixed, method = fix_polygon(self.polygon)
+            raise HTTPException(status_code=422, detail={
+                "message": f"zone {self.name!r}: its edges cross ({len(crossings)} crossing"
+                           f"{'s' if len(crossings) > 1 else ''}), so it has no clear inside. Use the suggested fix "
+                           "or redraw it.",
+                "zone_id": self.id, "crossings": crossings, "fix": {
+                    "method": method, "polygon": [[round(x, 4), round(y, 4)] for x, y in fixed]}})
+        return self
+
+
+class ZonesIn(BaseModel):
+    zones: list[ZoneIn] = Field(max_length=20)
+
+
+class CameraStart(BaseModel):
+    index: int = Field(0, ge=0, le=9, description="Webcam device index (0 = built-in camera)")
+
+
+def _check_camera_control(request: Request) -> None:
+    """Turning a webcam on is sensitive, so:
+    - only this machine may do it (the server listens on the LAN by default), unless
+      ALLOW_REMOTE_CAMERA_CONTROL=true;
+    - the body must be JSON. A cross-site page can't send a JSON POST without a CORS
+      preflight, and CORS here allows GET only, so another site can't switch the camera on.
+    """
+    _check_local_json(request, bool(config and config.allow_remote_camera_control), "camera control")
+
+
+def _check_local_json(request: Request, allow_remote: bool, action: str) -> None:
+    """This machine only (unless ``allow_remote``), and a JSON body (see above)."""
+    host = request.client.host if request.client else ""
+    local = host in ("127.0.0.1", "::1", "localhost") or host.startswith("127.")
+    if not local and not allow_remote:
+        raise HTTPException(status_code=403, detail=f"{action} is only allowed from this computer")
+    if not request.headers.get("content-type", "").startswith("application/json"):
+        raise HTTPException(status_code=415, detail="send a JSON body")
+
+
+def _camera_info(camera_id: str) -> dict:
+    with _cameras_lock:
+        p = _cameras.get(camera_id)
+        state = dict(_camera_state.get(camera_id, {"status": "stopped"}))
+    if p is not None:
+        src = p.video_source.stats
+        state.update(fps=p.stats["avg_fps"], frames=p.frame_count,
+                     source_error=src.get("error_message") or "",
+                     hardware_error=bool(src.get("hardware_error")))
+    return {"id": camera_id, "kind": "webcam", **state, "recording": _recorder_status(camera_id)}
+
+
+@app.get("/api/cameras")
+def list_cameras():
+    cams = []
+    if pipeline:
+        cams.append({"id": pipeline.config.camera_id, "kind": "primary", "status": "running",
+                     "source": pipeline.config.source, "fps": pipeline.stats["avg_fps"]})
+    cams.append(_camera_info(LAPTOP_CAMERA))
+    return to_serializable(cams)
+
+
+def _laptop_config(index: int) -> SentinelConfig:
+    cfg = copy.deepcopy(config)
+    # LAPTOP_CAMERA_SOURCE (set by the operator in .env, never by the API) swaps the webcam
+    # for an IP camera URL or a video file, which loops like the demo.
+    override = config.laptop_camera_source
+    cfg.source = override or str(index)
+    cfg.loop = bool(override) and not override.isdigit() and "://" not in override
+    cfg.camera_id = LAPTOP_CAMERA
+    cfg.frame_width, cfg.frame_height = 1280, 720
+    # No zones by default: the primary camera's zones are drawn for its own view.
+    zones = Path(cfg.output.db_path).resolve().parent / "zones_laptop.json"
+    zones.parent.mkdir(parents=True, exist_ok=True)
+    if not zones.exists():
+        zones.write_text(json.dumps({"zones": []}), encoding="utf-8")
+    cfg.zone.zones_file = str(zones)
+    return cfg
+
+
+def _run_camera(camera_id: str, cfg: SentinelConfig, mode: str | None = None) -> None:
+    try:
+        p = SentinelPipeline(cfg)  # loads the models: a few seconds
+        p.skeleton_only = _load_app_settings()["skeleton_only"]
+        _exam_attach(p)
+        _apply_object_classes(p, _load_app_settings())
+        if camera_id == TEST_CAMERA:
+            p.event_bus.unsubscribe("store")  # test footage never enters the event history or analytics
+            p.save_clips = False  # ... and never writes clips or snapshots
+        _attach(p, primary=False)
+        p.mode = mode or _load_app_settings()["mode"]
+        with _cameras_lock:
+            state = _camera_state.get(camera_id, {})
+            stopped_meanwhile = state.get("status") != "starting"
+            if not stopped_meanwhile:
+                _cameras[camera_id] = p
+                _camera_state[camera_id] = {"status": "running", "source": state.get("source", cfg.source),
+                                            "started_at": time.time()}
+        if stopped_meanwhile:  # Stop was pressed while the models were loading
+            p.stop()
+            return
+        p.run()  # returns when stopped (or the camera can't be opened and is stopped)
+    except Exception as e:
+        logger.exception("camera %s failed", camera_id)
+        with _cameras_lock:
+            _camera_state[camera_id] = {"status": "error", "error": str(e), "source": cfg.source}
+    finally:
+        _stop_recorder(camera_id)  # close the file if the camera stops while recording
+        with _cameras_lock:
+            _cameras.pop(camera_id, None)
+            _camera_frames.pop(camera_id, None)
+            if _camera_state.get(camera_id, {}).get("status") in ("running", "stopping"):
+                _camera_state[camera_id] = {"status": "stopped"}
+
+
+# --- "Test with demo footage" (warehouse) ---------------------------------------------------------
+# Plays a local clip as an extra camera ("test") in warehouse mode, so activity labels, REBA and
+# falls can be seen working without moving the real camera. Clips come only from a server-built
+# list: CAUCAFall subjects 1-5 (if the dataset is present locally; never bundled) and your own
+# recordings in data/recordings.
+
+TEST_CAMERA = "test"
+DEMO_CLIP_ACTIVITIES = ("Pick up object", "Kneel", "Sit down", "Walk", "Fall forward", "Fall backwards",
+                        "Fall left", "Fall right")
+
+
+def _demo_clips() -> list[dict]:
+    root = Path(__file__).resolve().parents[2]
+    clips = []
+    cauca = root / "data" / "datasets" / "caucafall" / "CAUCAFall"
+    for subject in range(1, 6):  # 6-10 are the held-out test set
+        for activity in DEMO_CLIP_ACTIVITIES:
+            folder = cauca / f"Subject.{subject}" / activity
+            avis = sorted(folder.glob("*.avi")) if folder.is_dir() else []
+            if avis:
+                clips.append({"id": f"cauca-{subject}-{activity.lower().replace(' ', '-')}",
+                              "label": f"{activity} (CAUCAFall subject {subject})", "source": "caucafall",
+                              "path": str(avis[0])})
+    for f in sorted(_recordings_dir().glob("*.mp4"), key=lambda x: x.stat().st_mtime, reverse=True):
+        clips.append({"id": f"rec-{f.stem}", "label": f"{f.name} (your recording)", "source": "recording",
+                      "path": str(f)})
+    return clips
+
+
+class DemoPlay(BaseModel):
+    clip: str = Field(..., max_length=120)
+
+
+@app.get("/api/demo/clips")
+def demo_clips():
+    """Clips for "Test with demo footage" (paths stay on the server)."""
+    return {"clips": [{k: v for k, v in c.items() if k != "path"} for c in _demo_clips()],
+            "test_camera": _camera_info(TEST_CAMERA)}
+
+
+@app.post("/api/demo/play", status_code=202)
+def demo_play(body: DemoPlay, request: Request):
+    """Play one listed clip on loop as camera "test", in warehouse mode, without notifications."""
+    _check_camera_control(request)
+    _require_pipeline()
+    clip = next((c for c in _demo_clips() if c["id"] == body.clip), None)
+    if clip is None:
+        raise HTTPException(status_code=404, detail=f"no clip {body.clip!r}")
+    _stop_camera(TEST_CAMERA)
+    cfg = copy.deepcopy(config)
+    cfg.source, cfg.loop, cfg.camera_id = clip["path"], True, TEST_CAMERA
+    cfg.frame_width, cfg.frame_height = 1280, 720
+    # A test run never sends notifications or webhooks.
+    n = cfg.notifications
+    n.telegram_bot_token = n.telegram_chat_id = n.smtp_host = ""
+    cfg.output.webhook_url = ""
+    zones = Path(cfg.output.db_path).resolve().parent / "zones_test.json"
+    zones.parent.mkdir(parents=True, exist_ok=True)
+    if not zones.exists():
+        zones.write_text(json.dumps({"zones": []}), encoding="utf-8")
+    cfg.zone.zones_file = str(zones)
+    with _cameras_lock:
+        _camera_state[TEST_CAMERA] = {"status": "starting", "source": clip["label"]}
+        thread = threading.Thread(target=_run_camera, args=(TEST_CAMERA, cfg, "warehouse"), daemon=True,
+                                  name="camera-test")
+        _camera_threads[TEST_CAMERA] = thread
+    thread.start()
+    return {"id": TEST_CAMERA, "status": "starting", "clip": clip["id"], "label": clip["label"]}
+
+
+@app.post("/api/demo/stop")
+def demo_stop(request: Request):
+    _check_camera_control(request)
+    _stop_camera(TEST_CAMERA)
+    return _camera_info(TEST_CAMERA)
+
+
+def _stop_camera(camera_id: str) -> None:
+    with _cameras_lock:
+        p = _cameras.get(camera_id)
+        thread = _camera_threads.get(camera_id)
+        if camera_id in _camera_state:
+            _camera_state[camera_id] = {"status": "stopping" if p else "stopped"}
+    if p is not None:
+        p.video_source.stop()
+    if thread is not None:
+        thread.join(timeout=15)
+    with _cameras_lock:
+        if _camera_state.get(camera_id, {}).get("status") == "stopping":
+            _camera_state[camera_id] = {"status": "stopped"}
+
+
+@app.post("/api/cameras/laptop/start", status_code=202)
+def start_laptop_camera(body: CameraStart, request: Request):
+    """Start detection on the laptop webcam (device ``index``) as camera "laptop"."""
+    _check_camera_control(request)
+    _require_pipeline()
+    with _cameras_lock:
+        status = _camera_state.get(LAPTOP_CAMERA, {}).get("status")
+        if status in ("starting", "running"):
+            return _camera_state[LAPTOP_CAMERA] | {"id": LAPTOP_CAMERA}
+        _camera_state[LAPTOP_CAMERA] = {"status": "starting", "source": str(body.index)}
+        thread = threading.Thread(
+            target=_run_camera, args=(LAPTOP_CAMERA, _laptop_config(body.index)),
+            daemon=True, name="camera-laptop",
+        )
+        _camera_threads[LAPTOP_CAMERA] = thread
+    thread.start()
+    logger.info("Laptop camera %d starting", body.index)
+    return {"id": LAPTOP_CAMERA, "status": "starting", "source": str(body.index)}
+
+
+@app.post("/api/cameras/laptop/stop")
+def stop_laptop_camera(request: Request):
+    """Stop the laptop webcam pipeline and release the camera."""
+    _check_camera_control(request)
+    with _cameras_lock:
+        p = _cameras.get(LAPTOP_CAMERA)
+        thread = _camera_threads.get(LAPTOP_CAMERA)
+        _camera_state[LAPTOP_CAMERA] = {"status": "stopping" if p else "stopped"}
+    if p is not None:
+        p.video_source.stop()  # releases the device; the pipeline loop then ends and cleans up
+    if thread is not None:
+        thread.join(timeout=15)
+    with _cameras_lock:
+        if _camera_state.get(LAPTOP_CAMERA, {}).get("status") == "stopping":
+            _camera_state[LAPTOP_CAMERA] = {"status": "stopped"}
+    return _camera_info(LAPTOP_CAMERA)
+
+
+_recorders: dict[str, Recorder] = {}
+
+
+def _recordings_dir() -> Path:
+    db_path = config.output.db_path if config else "data/events.db"
+    return Path(db_path).resolve().parent / "recordings"
+
+
+def _recorder_status(camera_id: str) -> dict:
+    """Recording state; file names only (they all live in the recordings folder)."""
+    rec = _recorders.get(camera_id)
+    status = rec.status() if rec else {"recording": False, "path": None, "seconds": 0.0, "last_path": None,
+                                       "last_seconds": 0.0}
+    for key in ("path", "last_path"):
+        if status.get(key):
+            status[key] = Path(status[key]).name
+    status["folder"] = str(_recordings_dir())
+    return status
+
+
+def _stop_recorder(camera_id: str) -> None:
+    rec = _recorders.get(camera_id)
+    if rec is not None and rec.recording:
+        rec.stop()
+
+
+@app.post("/api/cameras/laptop/record/start")
+def start_recording(request: Request):
+    """Record the laptop camera's raw frames (no overlays) to data/recordings/*.mp4."""
+    _check_camera_control(request)
+    with _cameras_lock:
+        p = _cameras.get(LAPTOP_CAMERA)
+    if p is None:
+        raise HTTPException(status_code=409, detail="start the camera first")
+    if _load_app_settings()["skeleton_only"]:
+        raise HTTPException(status_code=409, detail="Skeleton-only mode is on: no video is recorded "
+                                                    "(turn it off in Settings > Privacy to record).")
+    rec = _recorders.get(LAPTOP_CAMERA)
+    if rec is None:
+        rec = _recorders[LAPTOP_CAMERA] = Recorder(str(_recordings_dir()), prefix="laptop")
+    rec.start()
+    p.video_source.recorder = rec
+    return _recorder_status(LAPTOP_CAMERA)
+
+
+@app.post("/api/cameras/laptop/record/stop")
+def stop_recording(request: Request):
+    _check_camera_control(request)
+    rec = _recorders.get(LAPTOP_CAMERA)
+    if rec is not None:
+        rec.stop()
+    with _cameras_lock:
+        p = _cameras.get(LAPTOP_CAMERA)
+    if p is not None:
+        p.video_source.recorder = None
+    return _recorder_status(LAPTOP_CAMERA)
+
+
+@app.get("/api/alerts")
+def get_alerts(limit: int = Query(50, ge=1, le=1000), severity: str | None = None,
+               alert_type: str | None = None):
+    """Recent alerts, newest first, from the SQLite event log (survives restarts)."""
+    store = getattr(pipeline, "event_store", None) if pipeline else None
+    if store is not None:
+        events = store.query(limit=limit, severity=severity, types=[alert_type] if alert_type else None)
+        out = []
+        for e in events:
+            item = to_serializable(e.to_alert_dict())
+            item["has_clip"] = bool(e.alert_id) and _clip_path(e.alert_id) is not None
+            item["has_skeleton"] = bool(e.alert_id) and _incident_file(e.alert_id, "skeleton", "json") is not None
+            out.append(item)
+        return out
+    with history_lock:
+        data = list(alert_history)[::-1]
+    if severity:
+        data = [a for a in data if a["severity"] == severity]
+    if alert_type:
+        data = [a for a in data if a["alert_type"] == alert_type]
+    return data[:limit]
+
+
+# --- Events (unified schema) ---------------------------------------------------------
+
+def _store() -> EventStore:
+    store = getattr(pipeline, "event_store", None) if pipeline else None
+    if store is None:
+        raise HTTPException(status_code=503, detail="Event store not initialized")
+    return store
+
+
+def _csv(value: str | None) -> list[str] | None:
+    return [v.strip() for v in value.split(",") if v.strip()] if value else None
+
+
+def _event_json(event: Event) -> dict:
+    item = to_serializable(event.to_dict())
+    has_clip = bool(event.alert_id) and _clip_path(event.alert_id) is not None
+    has_thumb = bool(event.alert_id) and _incident_file(event.alert_id, "snapshot", "jpg") is not None
+    item["clip_url"] = f"/api/clips/{event.alert_id}" if has_clip else None
+    item["thumbnail_url"] = f"/api/snapshots/{event.alert_id}" if has_thumb else None
+    has_skeleton = bool(event.alert_id) and _incident_file(event.alert_id, "skeleton", "json") is not None
+    item["skeleton_url"] = f"/api/skeletons/{event.alert_id}" if has_skeleton else None
+    return item
+
+
+def _event_filters(types, severity, camera_id, zone_id, track_id, start, end) -> dict:
+    return {
+        "types": _csv(types),
+        "severity": _csv(severity),
+        "camera_id": camera_id,
+        "zone_id": zone_id,
+        "track_id": track_id,
+        "start": start,
+        "end": end,
+    }
+
+
+@app.get("/api/events")
+def list_events(
+    types: str | None = Query(None, description="Comma-separated event types"),
+    severity: str | None = Query(None, description="Comma-separated severities"),
+    camera_id: str | None = None,
+    zone_id: str | None = None,
+    track_id: int | None = None,
+    start: float | None = Query(None, description="Unix seconds; events overlapping [start, end]"),
+    end: float | None = None,
+    limit: int = Query(50, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+):
+    """Events in the unified schema, newest first, with paging and filters."""
+    store = _store()
+    filters = _event_filters(types, severity, camera_id, zone_id, track_id, start, end)
+    return {
+        "total": store.total(**filters),
+        "events": [_event_json(e) for e in store.query(limit=limit, offset=offset, **filters)],
+    }
+
+
+@app.get("/api/events/stats")
+def event_stats(
+    group_by: str = Query("type", description=f"One of: {', '.join(GROUP_BY_KEYS)}"),
+    types: str | None = None,
+    severity: str | None = None,
+    camera_id: str | None = None,
+    zone_id: str | None = None,
+    start: float | None = None,
+    end: float | None = None,
+):
+    """Event counts grouped by type, severity, zone, camera, hour of day, hour bucket or day."""
+    if group_by not in GROUP_BY_KEYS:
+        raise HTTPException(status_code=422, detail=f"group_by must be one of {list(GROUP_BY_KEYS)}")
+    filters = _event_filters(types, severity, camera_id, zone_id, None, start, end)
+    return {"group_by": group_by, "counts": _store().count(group_by, **filters)}
+
+
+@app.get("/api/events/{event_id}")
+def get_event(event_id: int):
+    event = _store().get(event_id)
+    if event is None:
+        raise HTTPException(status_code=404, detail="Event not found")
+    return _event_json(event)
+
+
+# --- App settings: mode and demo footage ------------------------------------------------------
+
+APP_MODES = ("posture", "warehouse", "exam")
+APP_DEFAULTS = {
+    "mode": "warehouse",
+    "demo_footage": False,
+    # Privacy: keep history this many days (0 = forever); deletions start only once the Privacy
+    # panel has been opened (privacy_seen), before that runs are dry runs.
+    "retention_days": 30,
+    "privacy_seen": False,
+    "skeleton_only": False,  # never store video or images: events keep keypoints only
+    "object_classes": None,  # {mode: [classes]} overrides; None = OBJECT_CLASSES* / the defaults
+    "hazard_classes": None,  # objects whose touch alerts; None = HAZARD_CLASSES / the defaults
+    "show_all_objects": False,  # debug: warehouse detects all 85 classes instead of its list
+}
+RETENTION_MAX_DAYS = 3650
+
+
+def _app_defaults() -> dict:
+    """Defaults until the settings are first saved. DEMO_FOOTAGE=true starts with the demo footage
+    running: the Docker image sets it, since a container has no webcam to show instead."""
+    flag = os.environ.get("DEMO_FOOTAGE", "").strip().lower() in ("1", "true", "yes", "on")
+    return {**APP_DEFAULTS, "demo_footage": flag}
+
+
+def _app_settings_path() -> Path:
+    db_path = config.output.db_path if config else "data/events.db"
+    return Path(db_path).resolve().parent / "app_settings.json"
+
+
+def _load_app_settings() -> dict:
+    try:
+        data = json.loads(_app_settings_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    out = {**_app_defaults(), **{k: v for k, v in data.items() if k in APP_DEFAULTS}}
+    if out["mode"] not in APP_MODES:
+        out["mode"] = APP_DEFAULTS["mode"]
+    out["demo_footage"] = bool(out["demo_footage"])
+    try:
+        out["retention_days"] = max(0, min(RETENTION_MAX_DAYS, int(out["retention_days"])))
+    except (TypeError, ValueError):
+        out["retention_days"] = APP_DEFAULTS["retention_days"]
+    out["privacy_seen"] = bool(out["privacy_seen"])
+    out["skeleton_only"] = bool(out["skeleton_only"])
+    classes = out.get("object_classes")
+    if isinstance(classes, list):  # before per-mode lists: one list, for warehouse
+        classes = {"warehouse": classes}
+    out["object_classes"] = ({m: [str(c) for c in v][:120] for m, v in classes.items()
+                              if m in ("warehouse", "exam", "posture") and isinstance(v, list)}
+                             if isinstance(classes, dict) else None) or None
+    out["show_all_objects"] = bool(out["show_all_objects"])
+    hazards = out.get("hazard_classes")
+    out["hazard_classes"] = [str(c) for c in hazards][:120] if isinstance(hazards, list) else None
+    return out
+
+
+def _save_app_settings(settings: dict) -> None:
+    path = _app_settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+
+
+def _apply_app_settings(primary, settings: dict) -> None:
+    """Mode on every running pipeline; the demo (primary) pipeline paused unless demo footage is on."""
+    with _cameras_lock:
+        pipelines = [p for p in (primary, *_cameras.values()) if p is not None]
+    for p in pipelines:
+        if getattr(getattr(p, "config", None), "camera_id", None) != TEST_CAMERA:  # test footage stays warehouse
+            p.mode = settings["mode"]
+    if primary is not None and hasattr(primary, "paused"):
+        primary.paused = not settings["demo_footage"]
+    _apply_privacy(settings, pipelines)
+
+
+# --- Exam Hall (docs/plans/exam-hall.md, stage E1) -------------------------------------------
+# Sessions, seats and per-seat calibration. Seats are labels (A1, B2...): no identities.
+
+_exam_store_obj = None
+SEAT_LABEL = r"^[A-Za-z]{1,2}[0-9]{1,2}$"
+
+
+def _exam_store():
+    global _exam_store_obj
+    from exam.store import ExamStore
+
+    db = config.output.db_path if config else "data/events.db"
+    if _exam_store_obj is None or _exam_store_obj.db_path != db:
+        _exam_store_obj = ExamStore(db)
+    return _exam_store_obj
+
+
+def _pipelines_for_camera(camera_id: str) -> list:
+    return [p for p in _all_pipelines() if getattr(getattr(p, "config", None), "camera_id", None) == camera_id]
+
+
+def _exam_attach(p) -> None:
+    """Load the camera's open exam session (if any) into its pipeline's exam monitor."""
+    monitor = getattr(p, "exam", None)
+    if monitor is None or not config:
+        return
+    store = _exam_store()
+    camera_id = p.config.camera_id
+    session = store.open_session_for(camera_id)
+    if session is None:
+        monitor.load(None)
+        return
+    monitor.load(session, store.seats(session["id"]), store.baselines(session["id"]))
+    monitor.on_baseline = lambda sid, label, b: _exam_store().save_baseline(sid, label, b)
+    monitor.on_status = lambda sid, status: _exam_store().update_session(sid, status=status)
+
+
+def _exam_reload(camera_id: str) -> None:
+    for p in _pipelines_for_camera(camera_id):
+        _exam_attach(p)
+
+
+def _exam_session_or_404(session_id: int) -> dict:
+    s = _exam_store().get_session(session_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail=f"no exam session {session_id}")
+    return s
+
+
+def _exam_live(session: dict) -> dict | None:
+    """The monitor's latest snapshot for this session, if its camera is running it."""
+    for p in _pipelines_for_camera(session["camera_id"]):
+        snap = p.exam.snapshot() if getattr(p, "exam", None) else None
+        if snap and snap.get("session_id") == session["id"]:
+            return snap
+    return None
+
+
+class ExamSessionIn(BaseModel):
+    name: str = Field(..., min_length=1, max_length=80)
+    room: str = Field("", max_length=80)
+    camera_id: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,32}$")
+    calibration_s: float = Field(120, ge=30, le=600)
+
+
+class SeatIn(BaseModel):
+    label: str = Field(..., pattern=SEAT_LABEL)
+    rect: tuple[float, float, float, float]
+
+    @field_validator("rect")
+    @classmethod
+    def _rect(cls, r):
+        x1, y1, x2, y2 = r
+        if not (0 <= x1 < x2 <= 1 and 0 <= y1 < y2 <= 1) or x2 - x1 < 0.02 or y2 - y1 < 0.02:
+            raise ValueError("rect must be x1 < x2, y1 < y2 inside 0-1, at least 0.02 across")
+        return r
+
+
+class SeatsIn(BaseModel):
+    seats: list[SeatIn] = Field(..., max_length=60)
+
+    @field_validator("seats")
+    @classmethod
+    def _unique(cls, seats):
+        labels = [s.label.upper() for s in seats]
+        if len(labels) != len(set(labels)):
+            raise ValueError("seat labels must be unique")
+        return seats
+
+
+class CopySeatsIn(BaseModel):
+    from_session_id: int
+
+
+def _exam_json(session: dict) -> dict:
+    store = _exam_store()
+    return {**session, "seats": [s.to_dict() for s in store.seats(session["id"])],
+            "baselines": {k: b.to_dict() for k, b in store.baselines(session["id"]).items()},
+            "live": _exam_live(session)}
+
+
+@app.get("/api/exam/sessions")
+def exam_sessions():
+    return {"sessions": _exam_store().list_sessions()}
+
+
+@app.post("/api/exam/sessions", status_code=201)
+def exam_create(body: ExamSessionIn, request: Request):
+    _check_local_json(request, bool(config and config.allow_remote_camera_control), "exam sessions")
+    store = _exam_store()
+    other = store.open_session_for(body.camera_id)
+    if other is not None:
+        raise HTTPException(status_code=409, detail=f"End the open session \"{other['name']}\" on this camera first.")
+    s = store.create_session(body.name, body.camera_id, room=body.room, calibration_s=body.calibration_s)
+    _exam_reload(body.camera_id)
+    return _exam_json(s)
+
+
+@app.get("/api/exam/sessions/{session_id}")
+def exam_get(session_id: int):
+    return _exam_json(_exam_session_or_404(session_id))
+
+
+@app.put("/api/exam/sessions/{session_id}/seats")
+def exam_put_seats(session_id: int, body: SeatsIn, request: Request):
+    """Replace the seats (setup only): rows, columns and neighbours are recomputed; labels kept."""
+    from exam import Seat, relabel
+
+    _check_local_json(request, bool(config and config.allow_remote_camera_control), "exam sessions")
+    s = _exam_session_or_404(session_id)
+    if s["status"] != "setup":
+        raise HTTPException(status_code=409, detail="Seats can only be changed before the exam starts.")
+    seats = relabel([Seat(label=x.label.upper(), rect=tuple(float(v) for v in x.rect)) for x in body.seats])
+    _exam_store().save_seats(session_id, seats)
+    _exam_reload(s["camera_id"])
+    return _exam_json(s)
+
+
+@app.post("/api/exam/sessions/{session_id}/detect-seats")
+def exam_detect_seats(session_id: int, request: Request):
+    """Proposed seats from people sitting still right now (not saved: edit, then PUT them)."""
+    _check_local_json(request, bool(config and config.allow_remote_camera_control), "exam sessions")
+    s = _exam_session_or_404(session_id)
+    pipes = [p for p in _pipelines_for_camera(s["camera_id"]) if getattr(p, "exam", None)]
+    if not pipes:
+        raise HTTPException(status_code=409, detail=f"Camera {s['camera_id']!r} isn't running.")
+    if getattr(pipes[0], "mode", None) != "exam":
+        raise HTTPException(status_code=409, detail="Switch the app to Exam Hall mode first.")
+    seats = pipes[0].exam.detect_seats()
+    return {"seats": [x.to_dict() for x in seats],
+            "message": None if seats else "Nobody has been sitting still for 5 s yet."}
+
+
+@app.post("/api/exam/sessions/{session_id}/copy-seats")
+def exam_copy_seats(session_id: int, body: CopySeatsIn, request: Request):
+    _check_local_json(request, bool(config and config.allow_remote_camera_control), "exam sessions")
+    s = _exam_session_or_404(session_id)
+    _exam_session_or_404(body.from_session_id)
+    if s["status"] != "setup":
+        raise HTTPException(status_code=409, detail="Seats can only be changed before the exam starts.")
+    from exam import Seat
+
+    seats = [Seat(label=x.label, rect=x.rect, row=x.row, col=x.col, neighbours=x.neighbours)
+             for x in _exam_store().seats(body.from_session_id)]
+    _exam_store().save_seats(session_id, seats)
+    _exam_reload(s["camera_id"])
+    return _exam_json(s)
+
+
+@app.post("/api/exam/sessions/{session_id}/start")
+def exam_start(session_id: int, request: Request):
+    """Start the exam: calibration first (no flags), then live."""
+    _check_local_json(request, bool(config and config.allow_remote_camera_control), "exam sessions")
+    s = _exam_session_or_404(session_id)
+    if s["status"] != "setup":
+        raise HTTPException(status_code=409, detail=f"The session is already {s['status']}.")
+    if not _exam_store().seats(session_id):
+        raise HTTPException(status_code=409, detail="Add seats first.")
+    _exam_store().update_session(session_id, status="calibrating", started_at=time.time())
+    _exam_reload(s["camera_id"])
+    return _exam_json(_exam_session_or_404(session_id))
+
+
+@app.post("/api/exam/sessions/{session_id}/end")
+def exam_end(session_id: int, request: Request):
+    _check_local_json(request, bool(config and config.allow_remote_camera_control), "exam sessions")
+    s = _exam_session_or_404(session_id)
+    if s["status"] in ("ended", "reviewed"):
+        return _exam_json(s)
+    _exam_store().update_session(session_id, status="ended", ended_at=time.time())
+    _exam_reload(s["camera_id"])
+    return _exam_json(_exam_session_or_404(session_id))
+
+
+# --- Warehouse objects (YOLO-World) -----------------------------------------------------------
+
+def _mode_classes(settings: dict | None = None) -> dict[str, list[str]]:
+    """Each mode's object list: the config's (OBJECT_CLASSES*), overridden by Settings."""
+    from config.settings import default_mode_classes
+
+    base = {m: list(v) for m, v in (config.objects.mode_classes if config else default_mode_classes()).items()}
+    saved = (settings or _load_app_settings()).get("object_classes") or {}
+    return {**base, **saved}
+
+
+def _apply_object_classes(p, settings: dict) -> None:
+    if hasattr(p, "mode_classes"):
+        p.mode_classes = _mode_classes(settings)  # the detector switches lists on the next frame
+        p.show_all_objects = bool(settings.get("show_all_objects"))
+    rules = getattr(p, "object_rules", None)
+    if rules is not None and settings.get("hazard_classes") is not None:
+        rules.hazard_classes = list(settings["hazard_classes"])
+
+
+def _hazards() -> list[str]:
+    from config.settings import DEFAULT_HAZARD_CLASSES
+
+    saved = _load_app_settings()["hazard_classes"]
+    if saved is not None:
+        return saved
+    return config.objects.hazards if config else list(DEFAULT_HAZARD_CLASSES)
+
+
+def _clean_names(names: list[str]) -> list[str]:
+    out = []
+    for c in names:
+        c = " ".join(c.split()).lower()
+        if not c or len(c) > 40 or not all(ch.isalnum() or ch in " -'" for ch in c):
+            raise ValueError(f"not a class name: {c!r} (letters, digits, spaces, - and ')")
+        if c not in out:
+            out.append(c)
+    return out
+
+
+class HazardsIn(BaseModel):
+    hazards: list[str] = Field(..., max_length=120)
+
+    @field_validator("hazards")
+    @classmethod
+    def _clean(cls, hazards):
+        return _clean_names(hazards)
+
+
+class ObjectClassesIn(BaseModel):
+    classes: list[str] = Field(..., max_length=120)  # empty: this mode detects no objects
+    mode: str = Field("warehouse", pattern=r"^(warehouse|exam|posture)$")
+
+    @field_validator("classes")
+    @classmethod
+    def _clean(cls, classes):
+        return _clean_names(classes)
+
+
+@app.get("/api/objects")
+def get_objects(mode: str = Query("warehouse", pattern=r"^(warehouse|exam|posture)$")):
+    """What a mode looks for besides people (each mode has its own list), and whether the
+    detectors are running."""
+    from config.settings import default_mode_classes
+
+    o = config.objects if config else None
+    det = getattr(pipeline, "object_detector", None) if pipeline else None
+    lists = _mode_classes()
+    return {"enabled": bool(o and o.enabled), "mode": mode, "classes": lists.get(mode, []), "modes": lists,
+            "show_all": _load_app_settings()["show_all_objects"],
+            "defaults": default_mode_classes().get(mode, []),
+            "confidence": o.confidence if o else None, "model": o.model_path if o else None,
+            "synonyms": o.synonyms if o else {}, "floors": o.floors if o else {}, "hazards": _hazards(),
+            "error": det.error if det else None}
+
+
+@app.put("/api/objects")
+def put_objects(body: ObjectClassesIn, request: Request):
+    """Change the class list. Re-encoding new names takes a few seconds once (then cached)."""
+    _check_local_json(request, bool(config and config.allow_remote_camera_control), "object classes")
+    s = _load_app_settings()
+    s["object_classes"] = {**(s.get("object_classes") or {}), body.mode: body.classes}
+    _save_app_settings(s)
+    for p in _all_pipelines():
+        _apply_object_classes(p, s)
+    return get_objects(body.mode)
+
+
+class ShowAllIn(BaseModel):
+    on: bool
+
+
+@app.put("/api/objects/show-all")
+def put_show_all(body: ShowAllIn, request: Request):
+    """Debug: warehouse detects every class both detectors know (85) instead of its list."""
+    _check_local_json(request, bool(config and config.allow_remote_camera_control), "object classes")
+    s = _load_app_settings()
+    s["show_all_objects"] = body.on
+    _save_app_settings(s)
+    for p in _all_pipelines():
+        _apply_object_classes(p, s)
+    return get_objects("warehouse")
+
+
+@app.put("/api/objects/hazards")
+def put_hazards(body: HazardsIn, request: Request):
+    """Which detected objects count as hazards (touching one alerts)."""
+    _check_local_json(request, bool(config and config.allow_remote_camera_control), "object classes")
+    s = _load_app_settings()
+    s["hazard_classes"] = body.hazards
+    _save_app_settings(s)
+    for p in _all_pipelines():
+        _apply_object_classes(p, s)
+    return get_objects("warehouse")
+
+
+# --- Privacy: retention ------------------------------------------------------------------
+
+_retention_worker = None
+
+
+def _retention():
+    from privacy import Retention
+
+    out = config.output if config else None
+    return Retention(out.db_path if out else "data/events.db", out.clips_dir if out else "data/clips",
+                     str(_recordings_dir()))
+
+
+def _start_retention():
+    global _retention_worker
+    from privacy import RetentionWorker
+
+    if _retention_worker is None:
+        _retention_worker = RetentionWorker(_retention(), _load_app_settings)
+        _retention_worker.start()
+
+
+def _retention_runner():
+    from privacy import RetentionWorker
+
+    return _retention_worker or RetentionWorker(_retention(), _load_app_settings)
+
+
+class PrivacyIn(BaseModel):
+    retention_days: int | None = Field(None, ge=0, le=RETENTION_MAX_DAYS)
+    skeleton_only: bool | None = None
+
+
+class DeleteNowIn(BaseModel):
+    retention_days: int = Field(..., ge=1, le=RETENTION_MAX_DAYS)  # must match the saved setting
+
+
+@app.get("/api/privacy")
+def get_privacy():
+    """What's stored, what the retention setting would delete now, and the last automatic run."""
+    from privacy import CATEGORIES, summary
+
+    s = _load_app_settings()
+    r = _retention()
+    days = s["retention_days"]
+    return {
+        "retention_days": days,
+        "skeleton_only": s["skeleton_only"],
+        "privacy_seen": s["privacy_seen"],
+        "dry_run": not s["privacy_seen"],
+        "categories": CATEGORIES,
+        "stored": summary(r.plan(cutoff=float("inf"))),
+        "would_delete": summary(r.plan(days)) if days > 0 else None,
+        "last_run": _retention_runner().last_run,
+    }
+
+
+@app.post("/api/privacy/seen")
+def privacy_seen(request: Request):
+    """The Privacy panel was opened: from now on retention deletes for real (it was a dry run)."""
+    _check_local_json(request, bool(config and config.allow_remote_camera_control), "privacy settings")
+    s = _load_app_settings()
+    if not s["privacy_seen"]:
+        s["privacy_seen"] = True
+        _save_app_settings(s)
+        logger.info("Privacy panel opened: retention now deletes (was a dry run)")
+    return {"privacy_seen": True}
+
+
+@app.put("/api/privacy")
+def put_privacy(body: PrivacyIn, request: Request):
+    _check_local_json(request, bool(config and config.allow_remote_camera_control), "privacy settings")
+    s = _load_app_settings()
+    if body.retention_days is not None:
+        s["retention_days"] = body.retention_days
+    if body.skeleton_only is not None:
+        s["skeleton_only"] = body.skeleton_only
+    _save_app_settings(s)
+    _apply_privacy(s)
+    logger.info("privacy settings: retention %s days, skeleton-only %s", s["retention_days"], s["skeleton_only"])
+    return get_privacy()
+
+
+@app.post("/api/privacy/delete-now")
+def privacy_delete_now(body: DeleteNowIn, request: Request):
+    """Delete everything older than the retention setting now (the preview in GET /api/privacy)."""
+    _check_local_json(request, bool(config and config.allow_remote_camera_control), "privacy settings")
+    s = _load_app_settings()
+    if body.retention_days != s["retention_days"]:
+        raise HTTPException(status_code=409, detail="The retention setting changed; check the preview again.")
+    return _retention_runner().delete_now(body.retention_days)
+
+
+def _apply_privacy(settings: dict, pipelines: list | None = None) -> None:
+    """Skeleton-only mode on every running pipeline (no clips, snapshots or images), and no
+    camera recording while it's on."""
+    if pipelines is None:
+        with _cameras_lock:
+            pipelines = [p for p in (pipeline, *_cameras.values()) if p is not None]
+    for p in pipelines:
+        if hasattr(p, "skeleton_only"):
+            p.skeleton_only = settings["skeleton_only"]
+    if settings["skeleton_only"]:
+        for camera_id in list(_recorders):
+            _stop_recorder(camera_id)
+
+
+class AppSettingsIn(BaseModel):
+    mode: str | None = Field(None, pattern=r"^(posture|warehouse|exam)$")
+    demo_footage: bool | None = None
+
+
+@app.get("/api/app")
+def get_app_settings():
+    """The app mode (posture | warehouse | exam) and whether the demo footage runs."""
+    return _app_view(_load_app_settings())
+
+
+def _app_view(settings: dict) -> dict:
+    return {k: settings[k] for k in ("mode", "demo_footage")}  # privacy settings: /api/privacy
+
+
+@app.put("/api/app")
+def put_app_settings(body: AppSettingsIn, request: Request):
+    """Switch mode and/or demo footage. Takes effect on the next frame and is remembered."""
+    _check_camera_control(request)  # this computer only, JSON body
+    settings = _load_app_settings()
+    if body.mode is not None:
+        settings["mode"] = body.mode
+    if body.demo_footage is not None:
+        settings["demo_footage"] = body.demo_footage
+    _save_app_settings(settings)
+    _apply_app_settings(pipeline, settings)
+    logger.info("app settings: %s", _app_view(settings))
+    return _app_view(settings)
+
+
+# --- Desk posture coach -----------------------------------------------------------------------
+
+def _posture_pipeline(camera: str | None):
+    """The laptop camera when it runs (the coach is for the person at this computer), else the
+    primary pipeline."""
+    if camera:
+        return _pipeline_for(camera)
+    with _cameras_lock:
+        p = _cameras.get(LAPTOP_CAMERA)
+    return p or _require_pipeline()
+
+
+@app.get("/api/posture")
+def get_posture(camera: str | None = None):
+    """The coach's current status, session totals and the session timeline (10 s buckets)."""
+    p = _posture_pipeline(camera)
+    return to_serializable({**p.posture.snapshot(), "timeline": p.posture.timeline(),
+                            "movement_timeline": p.posture.movement.timeline(), "mode": p.mode})
+
+
+@app.post("/api/posture/baseline")
+def start_posture_baseline(request: Request, camera: str | None = None):
+    """Start recording the upright baseline (about 3 s; sit upright facing the camera)."""
+    _check_camera_control(request)
+    p = _posture_pipeline(camera)
+    p.posture.start_baseline(now=p.posture._last_ts)
+    return to_serializable(p.posture.snapshot())
+
+
+@app.delete("/api/posture/baseline")
+def clear_posture_baseline(request: Request, camera: str | None = None):
+    _check_local_json(request, bool(config and config.allow_remote_camera_control), "posture control")
+    p = _posture_pipeline(camera)
+    p.posture.clear_baseline()
+    return to_serializable(p.posture.snapshot())
+
+
+@app.post("/api/posture/session/reset")
+def reset_posture_session(request: Request, camera: str | None = None):
+    _check_camera_control(request)
+    p = _posture_pipeline(camera)
+    p.posture.reset_session()
+    return to_serializable({**p.posture.snapshot(), "timeline": []})
+
+
+@app.post("/api/posture/reminder")
+def note_posture_reminder(request: Request, camera: str | None = None):
+    """The dashboard showed a reminder (counted in the session summary)."""
+    _check_camera_control(request)
+    p = _posture_pipeline(camera)
+    p.posture.note_reminder()
+    return {"reminders": p.posture.session.reminders}
+
+
+# Personal classifier: guided calibration, training, and "test my calibration".
+
+POSTURE_TEST_STEP_S = 15.0  # 6 postures x (3 s get ready + 15 s) = about 2 minutes
+
+
+class PostureRecordRequest(BaseModel):
+    posture: str = Field(..., max_length=32)
+
+
+@app.post("/api/posture/calibration/record")
+def record_posture(body: PostureRecordRequest, request: Request, camera: str | None = None):
+    """Record one posture for the calibration (a 3 s countdown, then about 20 s). Recording a
+    posture again replaces its earlier recording."""
+    _check_camera_control(request)
+    p = _posture_pipeline(camera)
+    try:
+        p.posture.start_recording("calibrate", [body.posture])
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return to_serializable(p.posture.snapshot())
+
+
+@app.post("/api/posture/calibration/train")
+def train_posture_model(request: Request, camera: str | None = None):
+    """Train the personal classifier on the recorded postures; returns the hold-out report."""
+    _check_camera_control(request)
+    p = _posture_pipeline(camera)
+    try:
+        report = p.posture.train_model()
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return to_serializable({"report": report, **p.posture.snapshot()})
+
+
+@app.delete("/api/posture/calibration")
+def clear_posture_calibration(request: Request, camera: str | None = None):
+    _check_local_json(request, bool(config and config.allow_remote_camera_control), "posture control")
+    p = _posture_pipeline(camera)
+    p.posture.clear_calibration()
+    return to_serializable(p.posture.snapshot())
+
+
+@app.post("/api/posture/test")
+def start_posture_test(request: Request, camera: str | None = None):
+    """"Test my calibration": prompt every posture once in random order, then score the saved
+    model on that new data."""
+    _check_camera_control(request)
+    p = _posture_pipeline(camera)
+    order = list(POSTURES)
+    random.shuffle(order)
+    try:
+        p.posture.start_recording("test", order, record_s=POSTURE_TEST_STEP_S)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return to_serializable(p.posture.snapshot())
+
+
+@app.post("/api/posture/recording/cancel")
+def cancel_posture_recording(request: Request, camera: str | None = None):
+    _check_camera_control(request)
+    p = _posture_pipeline(camera)
+    p.posture.cancel_recording()
+    return to_serializable(p.posture.snapshot())
+
+
+@app.get("/api/posture/model")
+def get_posture_model(camera: str | None = None):
+    """The trained model's hold-out report and its latest "test my calibration" report."""
+    p = _posture_pipeline(camera)
+    m = p.posture.model
+    if m is None:
+        return {"model": None}
+    return to_serializable({"model": p.posture.model_summary(), "report": m.report, "test_report": m.test_report})
+
+
+# Coaching: root-cause tips, stretch breaks, history.
+
+@app.get("/api/posture/tips")
+def get_posture_tip(camera: str | None = None):
+    """The strongest setup tip from the last 7 days (one at a time), with its evidence."""
+    p = _posture_pipeline(camera)
+    h = p.posture.history
+    return to_serializable({"tip": current_tip(h) if h else None})
+
+
+@app.post("/api/posture/tips/{rule}/dismiss")
+def dismiss_posture_tip(rule: str, request: Request, camera: str | None = None):
+    """Hide this tip for 7 days."""
+    _check_camera_control(request)
+    p = _posture_pipeline(camera)
+    if p.posture.history:
+        p.posture.history.dismiss(rule[:32], time.time() + 7 * 86400)
+    return {"tip": current_tip(p.posture.history) if p.posture.history else None}
+
+
+@app.get("/api/posture/history")
+def get_posture_history(camera: str | None = None, days: int = Query(7, ge=1, le=90)):
+    p = _posture_pipeline(camera)
+    h = p.posture.history
+    if not h:
+        return {"days": [], "corrections": []}
+    return to_serializable({"days": h.daily(days), "corrections": h.corrections(time.time() - days * 86400)})
+
+
+class CoachSettingsIn(BaseModel):
+    reminder_min: float | None = Field(None, ge=5, le=240)
+    head_down_enabled: bool | None = None
+    head_down_min: float | None = Field(None, ge=5, le=240)
+    lean_enabled: bool | None = None
+    lean_min: float | None = Field(None, ge=5, le=240)
+    demo_timings: bool | None = None
+
+
+_BREAK_ACTIONS = {"start": "start_break", "snooze": "snooze_break", "skip": "skip_break",
+                  "stood": "stood_up", "cancel": "cancel_break"}
+
+
+@app.post("/api/posture/break/{action}")
+def posture_break(action: str, request: Request, camera: str | None = None):
+    """Stretch break: start | snooze | skip | stood (the manual stand-up) | cancel."""
+    _check_camera_control(request)
+    if action not in _BREAK_ACTIONS:
+        raise HTTPException(404, f"unknown break action: {action}")
+    p = _posture_pipeline(camera)
+    try:
+        getattr(p.posture, _BREAK_ACTIONS[action])()
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return to_serializable(p.posture.snapshot())
+
+
+@app.get("/api/posture/settings")
+def get_coach_settings(camera: str | None = None):
+    return _posture_pipeline(camera).posture.settings.__dict__
+
+
+@app.put("/api/posture/settings")
+def put_coach_settings(body: CoachSettingsIn, request: Request, camera: str | None = None):
+    """Movement reminder time, long-hold warnings, and demo timings (1 min reminder, 2 min holds)."""
+    _check_camera_control(request)
+    p = _posture_pipeline(camera)
+    out = p.posture.update_settings(**body.model_dump(exclude_none=True))
+    for other in _pipelines():  # one shared settings file: every running coach follows it
+        coach = getattr(other, "posture", None)
+        if coach is not None and coach is not p.posture and hasattr(coach, "reload_settings"):
+            coach.reload_settings()
+    return out
+
+
+@app.delete("/api/posture/model")
+def delete_posture_model(request: Request, camera: str | None = None):
+    """Stop using the personal classifier (back to the baseline thresholds)."""
+    _check_local_json(request, bool(config and config.allow_remote_camera_control), "posture control")
+    p = _posture_pipeline(camera)
+    p.posture.delete_model()
+    return to_serializable(p.posture.snapshot())
+
+
+@app.get("/api/meta")
+def get_meta():
+    """Values for filter dropdowns and the Settings page (never includes secrets)."""
+    p = _require_pipeline()
+    store = _store()
+    n = p.config.notifications
+    return to_serializable({
+        "camera_id": p.config.camera_id,
+        "cameras": sorted(set(store.distinct("camera_id")) | {p.config.camera_id}),
+        "source": p.config.source,
+        "event_types": list(EVENT_TYPES),
+        "severities": list(SEVERITIES),
+        "zones": [
+            {"id": z["id"], "name": z["name"], "type": z["type"], "time_limit": z.get("time_limit"),
+             "direction": z.get("direction")}
+            for z in p.anomaly_engine.zone_overlay_data
+        ],
+        "notifications": {
+            "channels": [x.name for x in p.notifier.notifiers],
+            "telegram": n.telegram_enabled,
+            "email": n.email_enabled,
+            "webhook": bool(p.config.output.webhook_url),
+            "debounce_s": n.debounce_s,
+            "min_severity": n.min_severity,
+        },
+        "thresholds": {
+            "detection_confidence": p.config.detector.confidence_threshold,
+            "fall": vars(p.config.fall),
+            "loiter": vars(p.config.loiter),
+            "zone_alert_cooldown_s": p.config.zone.alert_cooldown,
+        },
+    })
+
+
+# --- Search (plain-English questions over the event log) -------------------------------------
+
+class SearchIn(BaseModel):
+    question: str = Field(min_length=1, max_length=500)
+
+
+_search_times: deque = deque()
+_search_lock = threading.Lock()
+
+
+def _search_config():
+    p = _require_pipeline()
+    return p.config
+
+
+def _zone_names() -> dict[str, str]:
+    """Zone id -> display name across every running camera (for 'the loading dock')."""
+    names: dict[str, str] = {}
+    with _cameras_lock:
+        pipelines = [pipeline, *_cameras.values()]
+    for p in pipelines:
+        engine = getattr(p, "anomaly_engine", None)
+        for z in (getattr(engine, "zone_overlay_data", None) or []):
+            if z.get("id"):
+                names.setdefault(z["id"], z.get("name") or z["id"])
+    return names
+
+
+def _search_rate_ok(limit_per_min: int) -> bool:
+    now = time.time()
+    with _search_lock:
+        while _search_times and now - _search_times[0] > 60:
+            _search_times.popleft()
+        if len(_search_times) >= max(1, limit_per_min):
+            return False
+        _search_times.append(now)
+        return True
+
+
+# --- Plain-English rules (Phase 3a) --------------------------------------------------------------
+# Compile: the sentence goes to the LLM once with the zone list; nothing runs until confirmed.
+
+_compile_times: deque = deque()
+
+
+def _compile_rate_ok(limit_per_min: int) -> bool:
+    now = time.time()
+    with _cameras_lock:
+        while _compile_times and now - _compile_times[0] > 60:
+            _compile_times.popleft()
+        if len(_compile_times) >= max(1, limit_per_min):
+            return False
+        _compile_times.append(now)
+        return True
+
+
+def _pipelines() -> list:
+    with _cameras_lock:
+        return [p for p in (pipeline, *_cameras.values()) if p is not None]
+
+
+def _rule_store():
+    store = getattr(pipeline, "rule_store", None) if pipeline else None
+    if store is None:
+        raise HTTPException(status_code=503, detail="Rule store not initialized")
+    return store
+
+
+def _zones_by_camera() -> dict[str, dict[str, tuple[str, str]]]:
+    """camera id -> {zone id: (name, type)} for every running camera."""
+    out: dict[str, dict[str, tuple[str, str]]] = {}
+    for p in _pipelines():
+        engine = getattr(p, "anomaly_engine", None)
+        cam = getattr(getattr(p, "config", None), "camera_id", "cam-0")
+        out[cam] = {z["id"]: (z.get("name") or z["id"], z.get("type") or "")
+                    for z in (getattr(engine, "zone_overlay_data", None) or []) if z.get("id")}
+    return out
+
+
+def _all_zones() -> dict[str, tuple[str, str]]:
+    zones: dict[str, tuple[str, str]] = {}
+    for cam_zones in _zones_by_camera().values():
+        for zid, v in cam_zones.items():
+            zones.setdefault(zid, v)
+    return zones
+
+
+def _reload_rules() -> None:
+    for p in _pipelines():
+        if hasattr(p, "reload_rules"):
+            p.reload_rules()
+
+
+def _rule_json(rule, stats: dict | None = None) -> dict:
+    from rules.describe import describe
+
+    names = {zid: name for zid, (name, _t) in _all_zones().items()}
+    fired = (stats or {}).get(rule.id, {})
+    return {**rule.model_dump(mode="json"), "preview": describe(rule, names),
+            "fired": fired.get("count", 0), "last_fired": fired.get("last")}
+
+
+def _rule_stats() -> dict[str, dict]:
+    """Rule id -> {count, last} from the event store (survives restarts)."""
+    try:
+        store = _store()
+    except HTTPException:
+        return {}
+    out = {}
+    for row in store.count_by_type_prefix("rule:"):
+        out[row["type"][5:]] = {"count": row["count"], "last": row["last"]}
+    return out
+
+
+class RuleCompileIn(BaseModel):
+    text: str = Field(..., min_length=1, max_length=300)
+
+
+class RuleCreateIn(BaseModel):
+    text: str = Field("", max_length=500)
+    rule: dict
+    camera_ids: list[str] | None = None
+
+
+class RulePatchIn(BaseModel):
+    enabled: bool | None = None
+    name: str | None = Field(None, min_length=1, max_length=80)
+    severity: str | None = Field(None, pattern=r"^(low|medium|high|critical)$")
+    duration_s: float | None = Field(None, ge=0, le=3600)
+    cooldown_s: float | None = Field(None, ge=0, le=86400)
+    actions: list[str] | None = None
+
+
+class PresetApplyIn(BaseModel):
+    replace: bool = False
+
+
+@app.get("/api/rules/status")
+def rules_status():
+    """Whether compiling is available (LLM configured) and whether built-ins are on."""
+    from llm import DEFAULT_MODELS, LLMError, build_llm
+
+    cfg = _require_pipeline().config
+    try:
+        client = build_llm(cfg.llm)
+        compile_ok = {"enabled": True, "provider": client.provider, "model": client.model, "reason": None}
+    except LLMError as e:
+        compile_ok = {"enabled": False, "provider": cfg.llm.provider,
+                      "model": cfg.llm.model or DEFAULT_MODELS.get(cfg.llm.provider), "reason": str(e)}
+    return {"compile": compile_ok, "builtins": cfg.rules.builtins,
+            "zones": [{"id": zid, "name": n, "type": ty} for zid, (n, ty) in _all_zones().items()]}
+
+
+@app.post("/api/rules/compile")
+def compile_rule(body: RuleCompileIn, request: Request):
+    """Compile a sentence into a draft rule (or a refusal). Saves nothing: confirm with POST /api/rules.
+    Only the sentence and the zone names/types go to the LLM provider."""
+    from datetime import datetime
+
+    from llm import LLMError, build_llm
+    from rules.compiler import RuleCompiler
+
+    cfg = _require_pipeline().config
+    _check_local_json(request, cfg.search.allow_remote, "rule compiling")
+    try:
+        llm = build_llm(cfg.llm)
+    except LLMError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    if not _compile_rate_ok(cfg.rules.compile_rate_limit_per_min):
+        raise HTTPException(status_code=429, detail="too many rules compiled; try again in a minute")
+    result = RuleCompiler(llm).compile(body.text, _all_zones(), now=datetime.now().strftime("%A %Y-%m-%d %H:%M"))
+    out = result.to_dict()
+    if result.body is not None:
+        out["camera_ids"] = _cameras_for(result.body)
+    return to_serializable(out)
+
+
+def _cameras_for(body) -> list[str]:
+    """The cameras that have every zone the rule names ([] = every camera)."""
+    zones = body.zones()
+    if not zones:
+        return []
+    return [cam for cam, zs in _zones_by_camera().items() if zones <= set(zs)]
+
+
+@app.get("/api/rules")
+def list_rules():
+    stats = _rule_stats()
+    out = [_rule_json(r, stats) for r in _rule_store().list()]
+    p = _require_pipeline()
+    builtins = [r for r in getattr(getattr(p, "rules", None), "rules", []) if r.builtin]
+    return to_serializable({"rules": out, "builtins": [_rule_json(r) for r in builtins]})
+
+
+@app.post("/api/rules")
+def create_rule(body: RuleCreateIn, request: Request):
+    """Save a rule the person confirmed (the draft from /compile, possibly adjusted)."""
+    from pydantic import ValidationError
+
+    from rules.dsl import Rule, RuleBody, check_references, format_errors, slugify
+
+    _check_camera_control(request)
+    store = _rule_store()
+    try:
+        draft = RuleBody.model_validate(body.rule)
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail="; ".join(format_errors(e))) from e
+    problems = check_references(draft, {zid: n for zid, (n, _t) in _all_zones().items()})
+    if problems:
+        raise HTTPException(status_code=422, detail="; ".join(problems))
+    cams = body.camera_ids if body.camera_ids is not None else _cameras_for(draft)
+    if draft.zones() and not cams:
+        raise HTTPException(status_code=422, detail="no camera has all the zones this rule names")
+    rule = Rule(**draft.model_dump(), id=slugify(draft.name, store.ids()), camera_ids=cams,
+                source_text=body.text.strip())
+    store.save(rule)
+    _reload_rules()
+    return to_serializable(_rule_json(rule))
+
+
+@app.patch("/api/rules/{rule_id}")
+def update_rule(rule_id: str, body: RulePatchIn, request: Request):
+    from pydantic import ValidationError
+
+    from rules.dsl import Rule, format_errors
+
+    _check_camera_control(request)
+    store = _rule_store()
+    rule = store.get(rule_id)
+    if rule is None:
+        raise HTTPException(status_code=404, detail=f"no rule {rule_id!r}")
+    changes = body.model_dump(exclude_none=True)
+    try:
+        updated = Rule.model_validate({**rule.model_dump(), **changes, "version": rule.version + 1})
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail="; ".join(format_errors(e))) from e
+    store.save(updated)
+    _reload_rules()
+    return to_serializable(_rule_json(updated, _rule_stats()))
+
+
+@app.delete("/api/rules/{rule_id}")
+def delete_rule(rule_id: str, request: Request):
+    _check_local_json(request, bool(config and config.allow_remote_camera_control), "rule control")
+    if not _rule_store().delete(rule_id):
+        raise HTTPException(status_code=404, detail=f"no rule {rule_id!r}")
+    _reload_rules()
+    return {"deleted": rule_id}
+
+
+@app.get("/api/presets")
+def list_presets():
+    from rules.presets import PRESETS
+
+    return {"presets": [{"name": k, **v} for k, v in PRESETS.items()]}
+
+
+@app.post("/api/presets/{name}/apply")
+def apply_preset(name: str, body: PresetApplyIn, request: Request):
+    """Load a preset's rules. Replacing rules that came from a preset needs ``replace: true``;
+    rules you wrote yourself are never touched."""
+    from rules.presets import PRESETS, preset_rules
+
+    _check_camera_control(request)
+    if name not in PRESETS:
+        raise HTTPException(status_code=404, detail=f"no preset {name!r}")
+    store = _rule_store()
+    zones = []
+    for cam_zones in _zones_by_camera().values():
+        for zid, (zname, ztype) in cam_zones.items():
+            zones.append({"id": zid, "name": zname, "zone_type": ztype, "time_limit": _zone_time_limit(zid)})
+    try:
+        rules = preset_rules(name, zones)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    existing = [r for r in store.list() if r.preset and r.enabled]
+    if existing and not body.replace:
+        raise HTTPException(status_code=409, detail=f"{len(existing)} preset rule(s) are on; "
+                                                    "send replace: true to replace them")
+    for r in rules:
+        r.camera_ids = _cameras_for(r)
+    store.replace_preset(name, rules)
+    _reload_rules()
+    return to_serializable({"applied": name, "rules": [_rule_json(r) for r in rules]})
+
+
+def _zone_time_limit(zone_id: str) -> float | None:
+    for p in _pipelines():
+        zm = getattr(getattr(p, "anomaly_engine", None), "zone_monitor", None)
+        for z in getattr(zm, "zones", []) or []:
+            if z.id == zone_id:
+                return z.time_limit
+    return None
+
+
+@app.get("/api/search/status")
+def search_status():
+    """Whether search is configured (provider, model); never returns keys."""
+    from llm import DEFAULT_MODELS, LLMError, build_llm
+
+    cfg = _search_config()
+    try:
+        client = build_llm(cfg.llm)
+        return {"enabled": True, "provider": client.provider, "model": client.model, "reason": None}
+    except LLMError as e:
+        provider = cfg.llm.provider
+        return {"enabled": False, "provider": provider, "model": cfg.llm.model or DEFAULT_MODELS.get(provider),
+                "reason": str(e)}
+
+
+@app.post("/api/search")
+def search(body: SearchIn, request: Request):
+    """Answer a question about recorded events. Streams Server-Sent Events: ``tool_call`` and
+    ``tool_result`` steps as the agent works, then one ``done`` with the answer and the cited
+    events (or ``error``). Read-only; only event metadata is sent to the LLM provider."""
+    from llm import LLMError, build_llm
+    from search import SearchAgent, SearchTools
+
+    cfg = _search_config()
+    _check_local_json(request, cfg.search.allow_remote, "search")
+    store = _store()
+    try:
+        llm = build_llm(cfg.llm)
+    except LLMError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    if not _search_rate_ok(cfg.search.rate_limit_per_min):
+        raise HTTPException(status_code=429, detail="too many questions; try again in a minute")
+
+    agent = SearchAgent(llm, SearchTools(store, _zone_names()), max_steps=cfg.search.max_steps,
+                        max_tokens=cfg.search.max_tokens_per_question)
+
+    def sse(payload: dict) -> str:
+        return f"data: {json.dumps(to_serializable(payload))}\n\n"
+
+    def stream():
+        try:
+            for step in agent.run(body.question):
+                if step["type"] != "done":
+                    yield sse(step)
+                    continue
+                r = step["result"]
+                cited = [store.get(i) for i in r.citations]
+                yield sse({
+                    "type": "done", "answer": r.answer, "stop": r.stop, "error": r.error,
+                    "citations": [_event_json(e) for e in cited if e is not None],
+                    "removed_citations": r.removed_citations, "steps": r.steps,
+                    "tool_calls": r.tool_calls, "latency_s": r.latency_s,
+                    "usage": {"input_tokens": r.usage.input_tokens, "output_tokens": r.usage.output_tokens},
+                    "provider": r.provider, "model": r.model,
+                })
+        except Exception as e:  # never leave the client hanging mid-stream
+            logger.exception("search failed")
+            yield sse({"type": "error", "error": f"search failed: {e}"})
+
+    return StreamingResponse(stream(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.get("/api/zones")
+def get_zones(camera: str | None = None):
+    return to_serializable(_pipeline_for(camera).anomaly_engine.zone_overlay_data)
+
+
+@app.put("/api/zones")
+def put_zones(body: ZonesIn, request: Request, camera: str = Query(...)):
+    """Replace a camera's zones (the zone editor). Takes effect on the next frame and is saved.
+
+    Only cameras whose zones live under the data directory (the laptop webcam) can be edited;
+    the demo scenarios' zone files are part of the repository and stay read-only.
+    """
+    _check_camera_control(request)  # same rule: this computer only, JSON body
+    from anomaly.zone_monitor import Zone
+
+    p = _pipeline_for(camera)
+    monitor = p.anomaly_engine.zone_monitor
+    data_dir = Path(p.config.output.db_path).resolve().parent
+    if data_dir not in Path(monitor.zones_file).resolve().parents:
+        raise HTTPException(status_code=409, detail=f"camera {camera!r} uses read-only scenario zones")
+    ids = [z.id for z in body.zones]
+    if len(ids) != len(set(ids)):
+        raise HTTPException(status_code=422, detail="zone ids must be unique")
+    zones = [
+        Zone(id=z.id, name=z.name, polygon=[tuple(pt) for pt in z.polygon], zone_type=z.zone_type,
+             time_limit=z.time_limit, direction=z.direction, active=z.active, load_score=z.load_score)
+        for z in (zone.checked() for zone in body.zones)
+    ]
+    monitor.replace_zones(zones)
+    logger.info("camera %s: %d zone(s) saved to %s", camera, len(zones), monitor.zones_file)
+    return to_serializable(monitor.get_zones_for_overlay())
+
+
+# --- Ergonomics (REBA) ------------------------------------------------------------------
+
+def _all_pipelines() -> list[SentinelPipeline]:
+    with _cameras_lock:
+        extra = list(_cameras.values())
+    return ([pipeline] if pipeline else []) + extra
+
+
+@app.get("/api/ergonomics/live")
+def ergonomics_live(camera: str | None = None):
+    """Current smoothed REBA score per tracked person (track IDs, not identities)."""
+    p = _pipeline_for(camera)
+    return to_serializable({
+        "camera_id": p.config.camera_id,
+        "min_confidence": p.config.ergonomics.min_confidence,
+        "tracks": list(p.anomaly_engine.ergonomics_snapshot.values()),
+    })
+
+
+@app.get("/api/ergonomics/time")
+def ergonomics_time(
+    group_by: str = Query("zone", pattern=r"^(zone|hour)$"),
+    day_from: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$", description="YYYY-MM-DD, default today"),
+    day_to: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    camera_id: str | None = None,
+):
+    """Seconds spent at each REBA risk level, grouped by zone (default) or hour of day.
+
+    Level "unknown" is time when the view was too unreliable to score (e.g. facing the camera).
+    There is no per-person (per track ID) grouping: aggregates never rank individuals.
+    """
+    from datetime import date
+
+    from ergonomics import LEVEL_NAMES
+
+    for p in _all_pipelines():  # include time accumulated since the last periodic flush
+        p.flush_ergo_time()
+    today = date.today().isoformat()
+    day_from = day_from or today
+    day_to = day_to or day_from
+    raw = _store().ergo_time(group_by, day_from, day_to, camera_id)
+    rows = {
+        key: {LEVEL_NAMES[lvl]: round(secs, 1) for lvl, secs in sorted(levels.items())}
+        for key, levels in raw.items()
+    }
+    return {"group_by": group_by, "day_from": day_from, "day_to": day_to,
+            "levels": [LEVEL_NAMES[i] for i in sorted(LEVEL_NAMES)], "rows": rows}
+
+
+@app.get("/api/ergonomics/postures")
+def ergonomics_postures(start: float | None = None, end: float | None = None, camera_id: str | None = None):
+    """What drove the ergo_risk events: count and peak REBA by dominant body part."""
+    events = _store().query(types=["ergo_risk"], start=start, end=end, camera_id=camera_id, limit=1000)
+    out: dict[str, dict] = {}
+    for e in events:
+        part = e.attributes.get("dominant") or "unknown"
+        row = out.setdefault(part, {"events": 0, "peak_reba": 0, "total_duration_s": 0.0})
+        row["events"] += 1
+        row["peak_reba"] = max(row["peak_reba"], int(e.attributes.get("reba_score") or 0))
+        row["total_duration_s"] = round(row["total_duration_s"] + float(e.attributes.get("duration") or 0), 1)
+    return {"postures": dict(sorted(out.items(), key=lambda kv: -kv[1]["events"]))}
+
+
+@app.get("/api/tracks")
+def get_tracks(camera: str | None = None):
+    p = _pipeline_for(camera)
+    output = []
+    for tid, feat in p.pose_estimator.get_all_features().items():
+        output.append({
+            "track_id": tid,
+            "speed": round(float(feat.speed), 2),
+            "displacement": round(float(feat.displacement), 2),
+            "time_tracked": round(float(feat.time_tracked), 1),
+            "fall_state": p.anomaly_engine.fall_detector.state_of(tid),
+        })
+    return to_serializable(output)
+
+
+def _incident_file(alert_id: str, prefix: str, ext: str) -> Path | None:
+    """Resolve a clip/snapshot path for an alert id, refusing anything outside clips_dir."""
+    if not config or not alert_id or not all(c.isalnum() or c in "-_" for c in alert_id):
+        return None
+    root = Path(config.output.clips_dir).resolve()
+    path = (root / alert_id / f"{prefix}_{alert_id}.{ext}").resolve()
+    if root not in path.parents or not path.is_file():
+        return None
+    return path
+
+
+def _clip_path(alert_id: str) -> Path | None:
+    return _incident_file(alert_id, "clip", "mp4")
+
+
+@app.get("/api/clips/{alert_id}")
+def get_clip(alert_id: str):
+    path = _clip_path(alert_id)
+    if path is None:
+        raise HTTPException(status_code=404, detail="Clip not found (it may still be recording)")
+    return FileResponse(path, media_type="video/mp4")
+
+
+@app.get("/api/skeletons/{alert_id}")
+def get_skeleton(alert_id: str):
+    """Skeleton-only mode's incident record: keypoints around the alert (no pixels)."""
+    path = _incident_file(alert_id, "skeleton", "json")
+    if path is None:
+        raise HTTPException(status_code=404, detail="Skeleton not found (it is written 5 s after the alert)")
+    return FileResponse(path, media_type="application/json")
+
+
+@app.get("/api/snapshots/{alert_id}")
+def get_snapshot(alert_id: str):
+    path = _incident_file(alert_id, "snapshot", "jpg")
+    if path is None:
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+    return FileResponse(path, media_type="image/jpeg")
+
+
+# --- WebSocket live feed -------------------------------------------------------------
+
+@app.websocket("/ws/feed")
+async def websocket_feed(websocket: WebSocket, camera: str | None = None):
+    """Alerts from every camera; frames from the primary camera, or from ``?camera=<id>``."""
+    global _loop
+    await websocket.accept()
+    _loop = asyncio.get_running_loop()
+    alerts: asyncio.Queue = asyncio.Queue(maxsize=200)
+    with _clients_lock:
+        _clients[websocket] = alerts
+    logger.info("Client connected to feed. Total: %d", len(_clients))
+
+    try:
+        with history_lock:
+            history = list(alert_history)[-50:]
+        await websocket.send_text(json.dumps({"type": "history", "alerts": history}))
+
+        last_sent = None  # the last frame message sent (a camera restart resets frame numbers)
+        while True:
+            # Alerts first, so none are delayed by frame throttling.
+            while not alerts.empty():
+                await websocket.send_text(alerts.get_nowait())
+            with _frame_lock:
+                if camera and not (pipeline and camera == pipeline.config.camera_id):
+                    message = _camera_frames.get(camera, (None, -1))[0]
+                else:
+                    message = _latest_message
+            if message is not None and message is not last_sent:
+                await websocket.send_text(message)
+                last_sent = message
+            await asyncio.sleep(1 / MAX_FEED_FPS)
+    except (WebSocketDisconnect, RuntimeError):
+        pass  # client went away; RuntimeError = send after close
+    except Exception as e:
+        logger.error("WebSocket error: %s", e)
+    finally:
+        with _clients_lock:
+            _clients.pop(websocket, None)
+        logger.info("Client disconnected. Total: %d", len(_clients))
+
+
+def stop_cameras() -> None:
+    """Release every extra camera (used at shutdown)."""
+    with _cameras_lock:
+        pipelines = list(_cameras.values())
+    for p in pipelines:
+        p.video_source.stop()
+
+
+
+
+# --- Dashboard (built React app) -----------------------------------------------------
+
+if FRONTEND_DIST.is_dir():
+    assets = FRONTEND_DIST / "assets"
+    if assets.is_dir():
+        app.mount("/assets", StaticFiles(directory=assets), name="assets")
+
+    @app.get("/{path:path}", include_in_schema=False)
+    def spa(path: str):
+        if path.startswith(("api/", "ws/")):  # unknown API routes are 404s, not the app
+            raise HTTPException(status_code=404, detail="Not found")
+        candidate = (FRONTEND_DIST / path).resolve()
+        if path and FRONTEND_DIST.resolve() in candidate.parents and candidate.is_file():
+            return FileResponse(candidate)
+        # index.html names the current hashed bundles: never cache it, or browsers keep
+        # loading the previous build after an update (the hashed assets can be cached).
+        return FileResponse(FRONTEND_DIST / "index.html", headers={"Cache-Control": "no-cache"})
+else:
+    @app.get("/", include_in_schema=False)
+    def root():
+        return {"message": "Sentinel AI API. Build the dashboard with `npm run build` in "
+                           "frontend/ to serve it here, or run `npm run dev`.",
+                "docs": "/docs"}
