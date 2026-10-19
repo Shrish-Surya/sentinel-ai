@@ -1,6 +1,6 @@
 # Sentinel AI: Real-Time Video Anomaly Detection
 
-[![CI](https://github.com/Gokuls007/sentinel-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/Gokuls007/sentinel-ai/actions/workflows/ci.yml)
+[![CI](https://github.com/Shrish-Surya/sentinel-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/Shrish-Surya/sentinel-ai/actions/workflows/ci.yml)
 ![Python 3.11](https://img.shields.io/badge/Python-3.11-blue.svg)
 ![YOLOv8](https://img.shields.io/badge/Model-YOLOv8n%20%2B%20pose-brightgreen.svg)
 ![License MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
